@@ -4,7 +4,7 @@ Data files are not included in this repository due to size and access restrictio
 
 ### Sources:
 - DHS (Demographic and Health Surveys): https://dhsprogram.com
-- Satellite PM2.5 data (NetCDF format): Copernicus / other sources
+- Satellite PM2.5 data (NetCDF format): EAC4 (ECMWF Atmospheric Composition Reanalysis 4)
 - India district shapefiles (2011 Census)
 
 ### Note:
