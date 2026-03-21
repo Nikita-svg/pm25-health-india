@@ -1,4 +1,4 @@
-# PM2.5 and Maternal Health in India
+# PM2.5 and Health in India
 
 ## Overview
 This project constructs a district-level panel dataset of air pollution exposure (PM2.5) in India using satellite-based data and administrative boundaries. The goal is to analyze the impact of air pollution on maternal and child health outcomes using DHS data.
