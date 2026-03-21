@@ -1,31 +1,35 @@
 # PM2.5 and Health in India
 
 ## Overview
-This project constructs a district-level panel dataset of air pollution (PM2.5) and fire-events exposure in India using satellite-based data and administrative boundaries. The goal is to analyze the impact of air pollution on maternal and child health outcomes using DHS data, using local fire-activity as an instrument. 
+This project constructs a cluster-level panel dataset of air pollution (PM2.5) and fire exposure in India using satellite data and administrative boundaries. The dataset is designed to study the causal impact of air pollution on maternal and child health outcomes using DHS data, with local fire activity as an instrumental variable.
 
 ## Data Sources
 - Satellite PM2.5 data (NetCDF format)
-- Satelite fire-events data (NASA FIRMS data)
+- Satellite fire event data (NASA FIRMS)
 - India district shapefiles (2011 Census)
 - DHS (Demographic and Health Surveys)
 
 ## Methodology
-The script performs the following steps:
-1. Loads district shapefiles and fixes geometry issues
-2. Extracts PM2.5 data from NetCDF raster files
-3. Aggregates grid-level pollution data to cluster-level (sub-unit of districts used for sampling)  averages 
+The pipeline performs the following steps:
+1. Loads and cleans district and DHS cluster shapefiles
+2. Extracts PM2.5 from raster (NetCDF) data
+3. Aggregates grid-level pollution to DHS cluster-level exposure
 4. Constructs a cluster-month panel dataset (84 months)
-5. Constructs fire events data for each cluster
-6. Exports data for econometric analysis in Stata
+5. Computes fire exposure measures within spatial buffers
+6. Prepares datasets for econometric analysis (e.g., IV estimation)
 
 ## Output
-- Cluster-level monthly PM2.5 dataset
-- Cluster-level monthly fire-events dataset 
-- Ready for merging with DHS cluster-level data
+- Cluster-level monthly PM2.5 exposure dataset
+- Cluster-level monthly fire exposure dataset
+- Analysis-ready panel data for merging with DHS microdata
+
+## Code Structure
+- `pm25_extraction_district_level.R`: Constructs district-level PM2.5 from satellite data
+- `pm25_dhs_fire_analysis.R`: Integrates PM2.5 with DHS clusters and fire data to build the final analysis dataset
 
 ## Tools Used
-- R (sf, raster, ncdf4, data.table)
-- Stata (for downstream analysis)
+- R (sf, raster, ncdf4, data.table, dplyr)
+- Stata (for downstream econometric analysis)
 
 ## Author
 Nikita Dhingra  
