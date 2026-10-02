@@ -1,0 +1,152 @@
+# =========================================================
+# Upwind / Downwind Fires in a 75-100 km Ring Around DHS Clusters
+# Author: Nikita Dhingra
+#
+# Input:  NASA FIRMS MODIS (Terra) fire CSVs, 2015-2021 (data/raw/fire/modis_YYYY_India.csv)
+#         DHS Round 5 (NFHS-5) cluster GPS points
+#         Cluster-month ERA5 weather from weather_extraction_dhs_cluster
+# Output: cluster-month counts of upwind and downwind fires 75-100 km away,
+#         with temperature and precipitation (data/processed/fire_ring_weather.dta)
+#
+# A fire is downwind if it lies within 90 degrees of the direction the
+# monthly mean wind blows toward (from the cluster), and upwind otherwise.
+# =========================================================
+
+library(sf)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(haven)
+
+# -------------------------------
+# File paths and settings
+# -------------------------------
+fire_dir     <- "data/raw/fire"
+dhs_path     <- "data/raw/dhs/cluster_locations/DHS.shp"
+weather_path <- "data/processed/weather_combined_all.rds"
+out_path     <- "data/processed/fire_ring_weather.dta"
+
+proj_crs   <- 7755        # WGS 84 / India NSF LCC (meters)
+chunk_size <- 500000L     # lower if short on memory
+
+# -------------------------------
+# 1. Load fire data, 2015-2021
+# -------------------------------
+fire_files <- list.files(fire_dir, pattern = "^modis_\\d{4}_India\\.csv$", full.names = TRUE)
+
+fires <- fire_files %>%
+  lapply(read_csv, col_types = cols(acq_date = col_character())) %>%
+  bind_rows() %>%
+  # FIRMS files use yyyy-mm-dd; files re-saved in Excel may use dd-mm-yyyy
+  mutate(acq_date = as.Date(parse_date_time(acq_date, orders = c("ymd", "dmy")))) %>%
+  filter(!is.na(acq_date)) %>%
+  mutate(ym = format(acq_date, "%Y-%m")) %>%
+  select(latitude, longitude, acq_date, ym)
+
+# Check: every year should have a large number of fires
+print(table(year(fires$acq_date)))
+
+fires_sf <- st_as_sf(fires, coords = c("longitude", "latitude"), crs = 4326)
+
+# -------------------------------
+# 2. DHS clusters and 100 km buffers
+# -------------------------------
+dhs <- st_read(dhs_path)
+dhs <- st_make_valid(dhs)
+dhs <- st_transform(dhs, 4326)
+
+buffer_100km <- st_buffer(select(dhs, DHSCLUST), dist = 100000)
+buffer_100km <- st_simplify(buffer_100km, dTolerance = 1000)
+
+# -------------------------------
+# 3. Fire-cluster pairs within 100 km (one row per pair)
+# -------------------------------
+fires100 <- fires_sf %>%
+  st_filter(buffer_100km) %>%
+  st_join(buffer_100km, join = st_intersects)
+
+fires100 <- st_transform(fires100, proj_crs)
+
+# Fire coordinates as columns, so later joins cannot misalign them
+fc <- st_coordinates(fires100)
+pairs <- fires100 %>%
+  st_drop_geometry() %>%
+  mutate(fire_x = fc[, 1], fire_y = fc[, 2]) %>%
+  select(DHSCLUST, ym, fire_x, fire_y)
+
+rm(fires, fires_sf, fires100, fc); gc()
+
+# -------------------------------
+# 4. Cluster coordinates (projected meters)
+# -------------------------------
+cl_xy <- st_coordinates(st_transform(dhs, proj_crs))
+cl_xy_proj <- data.frame(DHSCLUST = dhs$DHSCLUST, cl_x = cl_xy[, 1], cl_y = cl_xy[, 2])
+
+# -------------------------------
+# 5. Wind direction by cluster-month (ERA5 u10, v10)
+# -------------------------------
+weather <- readRDS(weather_path)
+
+wind <- weather %>%
+  as.data.frame() %>%
+  mutate(
+    wind_from = (270 - atan2(v10, u10) * 180 / pi) %% 360,  # meteorological: direction wind comes from
+    wind_to   = (wind_from + 180) %% 360                     # direction wind blows toward
+  ) %>%
+  select(DHSCLUST, ym, wind_to)
+
+# Checks: joins must not duplicate fire-cluster pairs
+stopifnot(anyDuplicated(wind[, c("DHSCLUST", "ym")]) == 0)
+stopifnot(anyDuplicated(cl_xy_proj$DHSCLUST) == 0)
+
+# -------------------------------
+# 6. Tag upwind/downwind, keep the 75-100 km ring, count by cluster-month
+#    (in chunks to limit memory)
+# -------------------------------
+N <- nrow(pairs)
+counts_list <- list()
+
+for (s in seq.int(1L, N, by = chunk_size)) {
+  e <- min(s + chunk_size - 1L, N)
+  cat(sprintf("Chunk %d - %d of %d\n", s, e, N))
+
+  counts_list[[length(counts_list) + 1]] <- pairs[s:e, ] %>%
+    left_join(cl_xy_proj, by = "DHSCLUST") %>%
+    left_join(wind, by = c("DHSCLUST", "ym")) %>%
+    mutate(
+      dist_m     = sqrt((fire_x - cl_x)^2 + (fire_y - cl_y)^2),
+      dx         = fire_x - cl_x,
+      dy         = fire_y - cl_y,
+      bearing_cf = (atan2(dx, dy) * 180 / pi + 360) %% 360,       # cluster -> fire, clockwise from north
+      angle_diff = ((bearing_cf - wind_to + 180) %% 360) - 180,   # -180..180
+      wind_side  = case_when(
+        is.na(wind_to)        ~ NA_character_,
+        abs(angle_diff) <= 90 ~ "downwind",
+        TRUE                  ~ "upwind"
+      )
+    ) %>%
+    filter(dist_m > 75000, dist_m <= 100000) %>%
+    count(DHSCLUST, ym, wind_side, name = "n")
+}
+
+ring_panel <- bind_rows(counts_list) %>%
+  group_by(DHSCLUST, ym, wind_side) %>%
+  summarise(n = sum(n), .groups = "drop") %>%
+  pivot_wider(names_from = wind_side, values_from = n, values_fill = 0) %>%
+  arrange(DHSCLUST, ym) %>%
+  mutate(total_fires_ring = coalesce(upwind, 0L) + coalesce(downwind, 0L))
+
+# Note: cluster-months with no ring fires do not appear here; they are zeros after merging.
+
+# -------------------------------
+# 7. Add temperature and precipitation, and export
+# -------------------------------
+fire_ring_weather <- ring_panel %>%
+  left_join(
+    weather %>% as.data.frame() %>% select(DHSCLUST, ym, t2m, tp),
+    by = c("DHSCLUST", "ym")
+  )
+
+dir.create(dirname(out_path), showWarnings = FALSE, recursive = TRUE)
+write_dta(fire_ring_weather, out_path)
