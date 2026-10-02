@@ -1,10 +1,18 @@
 # =========================================================
-# PM2.5 + DHS + Fire Data Integration
-# Author: Nikita Dhingra
+# PM2.5 Extraction to DHS Cluster Level (India)
+# Author: Nikita Dhingra 
+#
+# Input:  EAC4 monthly PM2.5 (NetCDF, kg/m^3), 84 monthly bands, Jan 2015 - Dec 2021
+#         DHS Round 5 (NFHS-5) cluster GPS points
+# Output: cluster-month PM2.5 in ug/m^3, plus each cluster's 2015-21 mean
+#         (data/processed/avg_pm25_v3.dta), and a map of mean PM2.5
+#
+# Each cluster is assigned the PM2.5 value of the grid cell it falls in.
 # =========================================================
 
-# Load libraries
 library(sf)
+library(raster)
+library(ncdf4)
 library(data.table)
 library(dplyr)
 library(lubridate)
@@ -12,107 +20,106 @@ library(ggplot2)
 library(haven)
 
 # -------------------------------
-# Load processed PM2.5 data
+# File paths (relative to repository root)
 # -------------------------------
-pm25_data <- read_dta("output/pm25_district_monthly.dta")
+nc_path  <- "data/raw/pollution/monthlypm2p5_india_subset.nc"
+dhs_path <- "data/raw/dhs/cluster_locations/DHS.shp"
+out_path <- "data/processed/avg_pm25_v3.dta"
+fig_path <- "output/figures/pm25_cluster_mean_map.png"
 
 # -------------------------------
-# Load DHS shapefile
+# Load DHS cluster points
 # -------------------------------
-dhs_shapefile <- st_read("data/dhs/DHS.shp") %>%
-  st_make_valid() %>%
-  st_transform(crs = 4326)
+dhs_shapefile <- st_read(dhs_path)
+dhs_shapefile <- st_make_valid(dhs_shapefile)
+dhs_shapefile <- st_transform(dhs_shapefile, crs = "EPSG:4326")
 
 # -------------------------------
-# Convert to spatial points
+# Get PM2.5 variable name from the NetCDF
 # -------------------------------
-pm25_sf <- st_as_sf(pm25_data, coords = c("coords_x1", "coords_x2"), crs = 4326)
+nc <- nc_open(nc_path)
+var_name <- names(nc$var)[1]
+nc_close(nc)
+
+# Band 1 is January 2015 
+print(getZ(raster(nc_path, band = 1, varname = var_name)))
 
 # -------------------------------
-# Create buffers (50km, 75km, 100km)
+# Extract PM2.5 at each cluster, for all 84 months
 # -------------------------------
-buffer_50km <- st_buffer(dhs_shapefile, dist = 50000)
-buffer_75km <- st_buffer(dhs_shapefile, dist = 75000)
-buffer_100km <- st_buffer(dhs_shapefile, dist = 100000)
+extracted_values_list <- vector("list", length = 84)
+
+for (band in 1:84) {
+
+  my_rast <- raster(x = nc_path, band = band, varname = var_name)
+
+  val_extract <- extract(
+    x     = my_rast,
+    y     = dhs_shapefile,
+    fun   = mean,
+    na.rm = TRUE,
+    sp    = TRUE
+  )
+
+  val_extract_dt <- as.data.table(st_drop_geometry(val_extract))
+  val_extract_dt[, band := band]
+
+  extracted_values_list[[band]] <- val_extract_dt
+}
+
+combined_results <- rbindlist(extracted_values_list, use.names = TRUE, fill = TRUE)
 
 # -------------------------------
-# Compute average PM2.5 per cluster
+# Convert units (kg/m^3 -> ug/m^3) and clean names
 # -------------------------------
-avg_pm25 <- pm25_data %>%
+combined_results[, pm25 := Particulate.matter.d....2.5.um * 10^9]
+combined_results[, Particulate.matter.d....2.5.um := NULL]
+setnames(combined_results, c("coords.x1", "coords.x2"), c("coords_x1", "coords_x2"))
+
+# -------------------------------
+# Convert band number to month (band 1 = Jan 2015)
+# -------------------------------
+start_date <- ymd("2015-01-31")
+combined_results[, month_year := format(start_date %m+% months(band - 1), "%b %Y")]
+
+# -------------------------------
+# Add each cluster's mean PM2.5 over 2015-21
+# -------------------------------
+avg_pm25 <- combined_results %>%
   group_by(DHSCLUST) %>%
-  summarise(mean_pm25 = mean(pm25, na.rm = TRUE))
+  mutate(mean_pm25 = mean(pm25, na.rm = TRUE)) %>%
+  ungroup()
 
 # -------------------------------
-# Plot spatial variation
+# Drop clusters with missing GPS (coordinates 0, 0)
 # -------------------------------
-avg_pm25_sf <- st_as_sf(avg_pm25, coords = c("coords_x1", "coords_x2"), crs = 4326)
+avg_pm25 <- avg_pm25 %>%
+  filter(coords_x1 != 0 & coords_x2 != 0)
 
-ggplot(avg_pm25_sf) +
-  geom_sf(aes(color = mean_pm25)) +
-  scale_color_viridis_c() +
+# -------------------------------
+# Map of mean PM2.5 by cluster
+# -------------------------------
+cluster_map <- avg_pm25 %>%
+  distinct(DHSCLUST, coords_x1, coords_x2, mean_pm25) %>%
+  st_as_sf(coords = c("coords_x1", "coords_x2"), crs = 4326)
+
+p <- ggplot() +
+  geom_sf(data = cluster_map, aes(color = mean_pm25), size = 1, alpha = 0.8) +
+  scale_color_viridis_c(option = "C", name = "PM2.5 (µg/m³)") +
   theme_minimal() +
-  ggtitle("Average PM2.5 (2015–2021)")
+  theme(
+    panel.grid = element_blank(),
+    axis.text  = element_blank(),
+    axis.title = element_blank(),
+    plot.title = element_text(size = 16)
+  ) +
+  labs(title = "Average PM2.5 Levels (2015–2021)")
+
+dir.create(dirname(fig_path), showWarnings = FALSE, recursive = TRUE)
+ggsave(fig_path, p, width = 7, height = 8, dpi = 300)
 
 # -------------------------------
-# Load DHS birth data
+# Export to Stata
 # -------------------------------
-dhs_births <- read_dta("data/dhs/births_2019.dta")
-
-# Merge cluster info
-dhs_births <- left_join(dhs_births, dhs_shapefile, by = "DHSCLUST")
-
-# -------------------------------
-# Match PM2.5 within 75km buffer
-# -------------------------------
-matches <- st_intersects(pm25_sf, buffer_75km, sparse = TRUE)
-
-matched_pm25 <- pm25_sf[lengths(matches) > 0, ]
-
-# Merge with births
-dhs_births_pm25 <- left_join(
-  dhs_births,
-  matched_pm25,
-  by = c("DHSCLUST", "month_year")
-)
-
-# -------------------------------
-# Load fire data
-# -------------------------------
-fire_files <- list.files("data/fire/", full.names = TRUE)
-
-fire_data <- fire_files %>%
-  lapply(read_csv) %>%
-  bind_rows() %>%
-  mutate(acq_date = dmy(acq_date)) %>%
-  filter(!is.na(acq_date))
-
-# Convert to spatial
-fire_sf <- st_as_sf(fire_data, coords = c("longitude", "latitude"), crs = 4326)
-
-# -------------------------------
-# Fires within 75km and 100km
-# -------------------------------
-fires_75 <- st_filter(fire_sf, buffer_75km)
-fires_100 <- st_filter(fire_sf, buffer_100km)
-
-# Ring: 75–100km
-fires_ring <- anti_join(fires_100, fires_75, by = "fire_id")
-
-# -------------------------------
-# Count fires per cluster-month
-# -------------------------------
-fire_counts <- fires_ring %>%
-  group_by(cluster_id, month) %>%
-  summarise(fire_events = n(), .groups = "drop")
-
-# -------------------------------
-# Final merge
-# -------------------------------
-final_data <- left_join(
-  dhs_births_pm25,
-  fire_counts,
-  by = c("DHSCLUST", "month_year")
-)
-
-# Save
-write_dta(final_data, "output/final_analysis_dataset.dta")
+dir.create(dirname(out_path), showWarnings = FALSE, recursive = TRUE)
+write_dta(avg_pm25, out_path)
