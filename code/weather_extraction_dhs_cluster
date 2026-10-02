@@ -1,0 +1,109 @@
+# =========================================================
+# ERA5 Weather Extraction to DHS Cluster Level (India)
+# Author: Nikita Dhingra
+#
+# Input:  ERA5 monthly NetCDF with t2m, u10, v10, tp (84 bands, Jan 2015 - Dec 2021)
+#         DHS Round 5 (NFHS-5) cluster GPS points
+# Output: cluster-month weather (wide: t2m, u10, v10, tp), in ERA5's native units
+#         (t2m in Kelvin, tp in m/day, u10/v10 in m/s)
+#         data/processed/weather_combined_4vars_wide.dta and weather_combined_all.rds
+# =========================================================
+
+library(sf)
+library(raster)
+library(data.table)
+library(lubridate)
+library(haven)
+
+# -------------------------------
+# File paths and settings
+# -------------------------------
+weather_nc_path <- "data/raw/weather/ERA5_weather_controls.nc"
+dhs_path        <- "data/raw/dhs/cluster_locations/DHS.shp"
+out_dta         <- "data/processed/weather_combined_4vars_wide.dta"
+out_rds         <- "data/processed/weather_combined_all.rds"
+
+weather_variables <- c("t2m", "u10", "v10", "tp")
+total_bands <- 84
+
+# -------------------------------
+# Load DHS cluster points
+# -------------------------------
+dhs_shapefile <- st_read(dhs_path)
+dhs_shapefile <- st_make_valid(dhs_shapefile)
+dhs_shapefile <- st_transform(dhs_shapefile, 4326)
+dhs_sp <- as(dhs_shapefile, "Spatial")
+
+# -------------------------------
+# Extract each variable at each cluster, for all 84 months
+# -------------------------------
+all_results_list <- list()
+
+for (v in weather_variables) {
+  message("Extracting variable: ", v)
+  band_list <- vector("list", total_bands)
+
+  for (band in 1:total_bands) {
+
+    r_band <- raster(x = weather_nc_path, band = band, varname = v)
+
+    # Georeferencing is set manually because raster does not read it from this file.
+    # The extent must match the file's longitude/latitude range.
+    extent(r_band) <- extent(60, 100, 5, 40)
+    crs(r_band)    <- "+proj=longlat +datum=WGS84"
+
+    # Both layers are already WGS84; kept so output matches the original run
+    r_band <- projectRaster(r_band, crs = st_crs(dhs_shapefile)$proj4string)
+
+    # Name the layer so the extracted column is called v
+    names(r_band) <- v
+
+    ext_sp <- extract(r_band, dhs_sp, sp = TRUE, na.rm = TRUE)
+
+    dt <- as.data.table(as.data.frame(ext_sp))
+    dt <- dt[, .(DHSCLUST, value = get(v))]
+    dt[, `:=`(band = band, variable = v)]
+
+    band_list[[band]] <- dt
+  }
+
+  all_results_list[[v]] <- rbindlist(band_list)
+}
+
+# -------------------------------
+# Reshape to wide: one row per cluster-month
+# -------------------------------
+combined_long <- rbindlist(all_results_list)
+weather <- dcast(combined_long, DHSCLUST + band ~ variable, value.var = "value")
+
+# Add cluster coordinates
+dhs_coords <- data.table(
+  DHSCLUST = dhs_shapefile$DHSCLUST,
+  lon      = dhs_shapefile$LONGNUM,
+  lat      = dhs_shapefile$LATNUM
+)
+weather <- merge(weather, dhs_coords, by = "DHSCLUST", all.x = TRUE)
+
+# -------------------------------
+# Convert band number to month (band 1 = Jan 2015)
+# -------------------------------
+band_dates <- seq.Date(from = as.Date("2015-01-01"), by = "month", length.out = total_bands)
+weather[, `:=`(
+  ym    = format(band_dates[band], "%Y-%m"),
+  year  = year(band_dates[band]),
+  month = month(band_dates[band])
+)]
+
+# -------------------------------
+# Checks: all four variables, 84 months, one row per cluster-month
+# -------------------------------
+print(table(combined_long$variable))
+stopifnot(length(unique(weather$band)) == total_bands)
+stopifnot(anyDuplicated(weather[, .(DHSCLUST, ym)]) == 0)
+
+# -------------------------------
+# Export
+# -------------------------------
+dir.create(dirname(out_dta), showWarnings = FALSE, recursive = TRUE)
+write_dta(weather, out_dta)
+saveRDS(weather, out_rds)
